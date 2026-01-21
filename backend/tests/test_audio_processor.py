@@ -1,63 +1,90 @@
-import pytest
 import asyncio
-from ..services.audio_processor import AudioProcessor
+import itertools
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from ..services.audio_processor import AudioChunk, AudioProcessor
+from ..services.database import TranscriptRecord
+
+
+@pytest.fixture()
+def processor_setup():
+    queue = asyncio.Queue()
+
+    transcription_service = MagicMock()
+    transcription_service.transcribe = AsyncMock(return_value="transcript")
+
+    transcript_id = itertools.count(1)
+
+    async def fake_insert(**kwargs):
+        return TranscriptRecord(
+            id=next(transcript_id),
+            session_id=kwargs["session_id"],
+            start_time=kwargs["start_time"],
+            end_time=kwargs["end_time"],
+            text=kwargs["text"],
+            created_at=kwargs["end_time"],
+        )
+
+    repository = MagicMock()
+    repository.insert_transcript = AsyncMock(side_effect=fake_insert)
+
+    summary_scheduler = MagicMock()
+    summary_scheduler.consider_transcript = AsyncMock()
+
+    processor = AudioProcessor(
+        queue,
+        transcription_service=transcription_service,
+        repository=repository,
+        summary_scheduler=summary_scheduler,
+        target_window_seconds=1,
+    )
+
+    return {
+        "processor": processor,
+        "transcription_service": transcription_service,
+        "repository": repository,
+        "summary_scheduler": summary_scheduler,
+    }
+
 
 @pytest.mark.asyncio
-async def test_audio_accumulation():
-    """
-    Tests that the AudioProcessor accumulates small chunks and only
-    triggers 'transcribe' once the THRESHOLD is reached.
-    """
-    # 1. Setup
-    queue = asyncio.Queue()
-    processor = AudioProcessor(queue)
-    
-    # We create a small chunk (10,000 bytes)
-    # Our threshold is 96,000 bytes, so 10 chunks should trigger it
-    small_chunk = b"\x00" * 10000 
+async def test_audio_accumulation_triggers_flush(processor_setup):
+    processor = processor_setup["processor"]
+    chunk_size = processor.threshold_bytes // 2
 
-    # 2. Start the processor in the background
-    # we use a task so we can cancel it later
-    worker_task = asyncio.create_task(processor.run_forever())
+    await processor._handle_chunk(AudioChunk("room1", b"\x00" * chunk_size))
+    assert len(processor.buffers["room1"].data) == chunk_size
 
-    # 3. Feed the queue
-    for _ in range(9):
-        await queue.put(small_chunk)
-    
-    # Allow a tiny bit of time for the loop to process
-    await asyncio.sleep(0.1)
-    
-    # ASSERT: The buffer should have 90,000 bytes and NOT be empty yet
-    assert len(processor.buffer) == 90000
+    await processor._handle_chunk(AudioChunk("room1", b"\x00" * chunk_size))
 
-    # 4. Send the 10th chunk to cross the 96,000 threshold
-    await queue.put(small_chunk)
-    await asyncio.sleep(0.1)
+    assert len(processor.buffers["room1"].data) == 0
+    processor_setup["transcription_service"].transcribe.assert_awaited_once()
+    processor_setup["repository"].insert_transcript.assert_awaited_once()
+    processor_setup["summary_scheduler"].consider_transcript.assert_awaited_once()
 
-    # ASSERT: The buffer should have been cleared after processing
-    assert len(processor.buffer) == 0
-    
-    # Cleanup
-    worker_task.cancel()
 
 @pytest.mark.asyncio
-async def test_processor_resilience():
-    queue = asyncio.Queue()
-    processor = AudioProcessor(queue)
-    
-    # Force the transcribe method to crash
-    async def broken_transcribe(data):
-        raise ValueError("AI Service Offline!")
-    
-    processor.transcribe = broken_transcribe
-    
-    worker_task = asyncio.create_task(processor.run_forever())
-    
-    # Send enough data to trigger the 'broken' transcription
-    await queue.put(b"\x00" * 100000)
-    await asyncio.sleep(0.1)
-    
-    # If the loop is still alive, we should be able to send more data
-    assert worker_task.done() is False 
-    
-    worker_task.cancel()
+async def test_processor_resilience_on_transcription_failure(processor_setup):
+    processor = processor_setup["processor"]
+    processor_setup["transcription_service"].transcribe.side_effect = RuntimeError("offline")
+
+    await processor._handle_chunk(AudioChunk("room2", b"\x00" * processor.threshold_bytes))
+
+    assert len(processor.buffers["room2"].data) == 0
+    processor_setup["repository"].insert_transcript.assert_not_awaited()
+    processor_setup["summary_scheduler"].consider_transcript.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_force_flush_drains_partial_buffer(processor_setup):
+    processor = processor_setup["processor"]
+
+    await processor._handle_chunk(AudioChunk("room3", b"\x00" * (processor.threshold_bytes // 4)))
+    assert len(processor.buffers["room3"].data) > 0
+
+    await processor.force_flush("room3")
+
+    assert len(processor.buffers["room3"].data) == 0
+    processor_setup["transcription_service"].transcribe.assert_awaited_once()
