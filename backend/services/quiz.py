@@ -14,7 +14,7 @@ class QuizService:
     """Generates quiz questions with recency bias from a context package."""
 
     def __init__(self, *, model: str = "gemini-1.5-pro") -> None:
-        self.client = genai.Client()
+        self._client = None
         self.model = model
         self.schema = types.Schema(
             type=types.Type.ARRAY,
@@ -39,6 +39,13 @@ class QuizService:
                 required=["question", "options", "answer_index"],
             ),
         )
+
+    @property
+    def client(self) -> genai.Client:
+        """Lazily initialize the Gemini client."""
+        if self._client is None:
+            self._client = genai.Client()
+        return self._client
 
     async def generate_questions(
         self, context: ContextPackage, *, question_count: int = 3

@@ -20,8 +20,15 @@ class SummarizationService:
         Args:
             model: The Gemini model to use for summarization.
         """
-        self.client = genai.Client()
+        self._client = None
         self.model = model
+
+    @property
+    def client(self) -> genai.Client:
+        """Lazily initialize the Gemini client."""
+        if self._client is None:
+            self._client = genai.Client()
+        return self._client
 
     async def summarize(self, transcripts: Sequence[TranscriptRecord]) -> str:
         """Summarize a sequence of transcript records into concise bullet points.
@@ -133,15 +140,15 @@ class SummaryScheduler:
             record: The new TranscriptRecord to consider.
         """
         session_id = record.session_id
-        last_run = self._last_summary_ts.get(session_id, 0.0)
-        if record.end_time - last_run < self.window_seconds:
+        last_run = self._last_summary_ts.get(session_id)
+        if last_run is not None and record.end_time - last_run < self.window_seconds:
             return
 
         lock = self._locks[session_id]
         async with lock:
             # Re-check after acquiring lock to avoid duplicate work
-            last_run = self._last_summary_ts.get(session_id, 0.0)
-            if record.end_time - last_run < self.window_seconds:
+            last_run = self._last_summary_ts.get(session_id)
+            if last_run is not None and record.end_time - last_run < self.window_seconds:
                 return
 
             window_start = record.end_time - self.window_seconds

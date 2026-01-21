@@ -1,16 +1,16 @@
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
-from ..services.audio_processor import app, rooms
+
+from ..main import app, manager
 
 client = TestClient(app)
 
 @pytest.fixture(autouse=True)
-def clear_rooms():
-    """Clear rooms before and after each test"""
-    rooms.clear()
+def clear_connections():
+    """Clear ConnectionManager state between tests."""
+    manager.active_connections.clear()
     yield
-    rooms.clear()
+    manager.active_connections.clear()
 
 def test_websocket_broadcast():
     """
@@ -31,21 +31,16 @@ def test_websocket_broadcast():
             assert data2["message"] == "Room math101 says: Hello Class!"
 
 def test_room_isolation():
-    """
-    Test that messages in Room A do not leak into Room B.
-    """
+    """Rooms operate independently and never receive each other's traffic."""
     with client.websocket_connect("/ws/room_a") as ws_a:
         with client.websocket_connect("/ws/room_b") as ws_b:
             ws_a.send_text("Secret message")
-            
-            # Room A gets the message
             data_a = ws_a.receive_json()
-            assert "Secret message" in data_a["message"]
-            
-            # Room B should NOT receive messages from Room A
-            # Using pytest.raises to ensure no message arrives
-            with pytest.raises(Exception):
-                ws_b.receive_json(timeout=0.1)
+            assert data_a["message"] == "Room room_a says: Secret message"
+
+            ws_b.send_text("Different")
+            data_b = ws_b.receive_json()
+            assert data_b["message"] == "Room room_b says: Different"
 
 def test_single_client_receives_own_message():
     """

@@ -25,9 +25,16 @@ class TranscriptionService:
 		mime_type: str = "audio/wav",
 		client: Optional[genai.Client] = None,
 	) -> None:
-		self.client = client or genai.Client()
+		self._client = client
 		self.model = model
 		self.mime_type = mime_type
+
+	@property
+	def client(self) -> genai.Client:
+		"""Lazily initialize the Gemini client."""
+		if self._client is None:
+			self._client = genai.Client()
+		return self._client
 
 	async def transcribe(self, audio_bytes: bytes, prompt: Optional[str] = None) -> str:
 		if not audio_bytes:
