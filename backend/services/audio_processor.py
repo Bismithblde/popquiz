@@ -1,55 +1,104 @@
+from __future__ import annotations
+
 import asyncio
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import DefaultDict, Dict
+
+from .database import LectureRepository, TranscriptRecord
+from .summarization import SummaryScheduler
+from .transcription import TranscriptionService
+
+
+BYTES_PER_SAMPLE = 2  # 16-bit audio
+
+
+@dataclass(slots=True)
+class AudioChunk:
+    session_id: str
+    payload: bytes
+    received_at: float = field(default_factory=lambda: time.time())
+
+
+@dataclass(slots=True)
+class SessionBuffer:
+    data: bytearray = field(default_factory=bytearray)
+    started_at: float = field(default_factory=lambda: time.time())
+
 
 class AudioProcessor:
-    """
-    Processes audio chunks from an async queue and manages the accumulation buffer.
-    """
-    def __init__(self, queue: asyncio.Queue):
-        self.queue = queue
-        self.buffer = bytearray()
-        # Threshold: ~3 seconds of 16kHz 16-bit audio
-        self.THRESHOLD = 96000 
-        
-        # ADDED: Store the results of the transcriptions
-        self.transcript_history = []
+    """Processes queued audio chunks and orchestrates transcription + storage."""
 
-    async def run_forever(self):
+    def __init__(
+        self,
+        queue: asyncio.Queue,
+        *,
+        transcription_service: TranscriptionService,
+        repository: LectureRepository,
+        summary_scheduler: SummaryScheduler,
+        sample_rate_hz: int = 16_000,
+        target_window_seconds: int = 60,
+    ) -> None:
+        self.queue = queue
+        self.transcription_service = transcription_service
+        self.repository = repository
+        self.summary_scheduler = summary_scheduler
+        self.sample_rate_hz = sample_rate_hz
+        self.bytes_per_second = sample_rate_hz * BYTES_PER_SAMPLE
+        self.threshold_bytes = self.bytes_per_second * target_window_seconds
+        self.buffers: Dict[str, SessionBuffer] = {}
+        self.transcript_history: DefaultDict[str, list[TranscriptRecord]] = defaultdict(list)
+
+    async def run_forever(self) -> None:
         print("Audio Processor Worker Started!")
         while True:
-            chunk = await self.queue.get()
+            chunk: AudioChunk = await self.queue.get()
             try:
-                # 1. Accumulate audio
-                self.buffer.extend(chunk)
-
-                # 2. Check threshold
-                if len(self.buffer) >= self.THRESHOLD:
-                    audio_to_send = bytes(self.buffer)
-                    self.buffer.clear()
-                    
-                    # 3. DANGEROUS ZONE: Wrap AI call in its own try/except
-                    # This prevents the whole 'while' loop from crashing if the API is down
-                    try:
-                        await self.transcribe(audio_to_send)
-                    except Exception as e:
-                        print(f"⚠️ Transcription failed: {e}")
-                        # Optionally: You could put the audio back in a retry queue here
-            
-            except Exception as e:
-                print(f"❌ Critical Worker Error: {e}")
-            
+                await self._handle_chunk(chunk)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                print(f"❌ Critical Worker Error for {chunk.session_id}: {exc}")
             finally:
-                # Always mark the task as done so the queue doesn't bloat
                 self.queue.task_done()
 
-    async def transcribe(self, full_audio: bytes):
-        """
-        Integration point for Gemini / Whisper.
-        """
-        # Placeholder for actual AI API call
-        await asyncio.sleep(0.5) 
-        
-        # MOCK RESULT: In reality, this comes from the AI
-        mock_text = f"Teacher said something at {len(full_audio)} bytes."
-        
-        self.transcript_history.append(mock_text)
-        print(f"--- AI TRANSCRIBED: {mock_text} ---")
+    async def force_flush(self, session_id: str) -> None:
+        buffer = self.buffers.get(session_id)
+        if not buffer or not buffer.data:
+            return
+        await self._flush_buffer(session_id, buffer)
+
+    async def _handle_chunk(self, chunk: AudioChunk) -> None:
+        buffer = self.buffers.setdefault(chunk.session_id, SessionBuffer())
+        if not buffer.data:
+            buffer.started_at = chunk.received_at
+        buffer.data.extend(chunk.payload)
+
+        if len(buffer.data) >= self.threshold_bytes:
+            await self._flush_buffer(chunk.session_id, buffer, end_time=chunk.received_at)
+
+    async def _flush_buffer(
+        self, session_id: str, buffer: SessionBuffer, *, end_time: float | None = None
+    ) -> None:
+        if not buffer.data:
+            return
+
+        start_time = buffer.started_at
+        final_time = end_time or time.time()
+        audio_bytes = bytes(buffer.data)
+        buffer.data.clear()
+        buffer.started_at = final_time
+
+        try:
+            transcript_text = await self.transcription_service.transcribe(audio_bytes)
+        except Exception as exc:
+            print(f"⚠️ Transcription failed for {session_id}: {exc}")
+            return
+
+        record = await self.repository.insert_transcript(
+            session_id=session_id,
+            start_time=start_time,
+            end_time=final_time,
+            text=transcript_text,
+        )
+        self.transcript_history[session_id].append(record)
+        await self.summary_scheduler.consider_transcript(record)
